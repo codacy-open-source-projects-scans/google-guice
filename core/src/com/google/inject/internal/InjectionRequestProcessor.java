@@ -24,6 +24,7 @@ import com.google.inject.spi.InjectionPoint;
 import com.google.inject.spi.InjectionRequest;
 import com.google.inject.spi.StaticInjectionRequest;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -76,12 +77,12 @@ final class InjectionRequestProcessor extends AbstractProcessor {
       InjectionRequest<T> request, Set<InjectionPoint> injectionPoints, Errors errors) {
     // We don't need to keep the return value, because we're not _using_ the injected value
     // anyway... we're just injecting it.
-    Initializable<T> unused =
+    Optional<Initializable<T>> unused =
         initializer.requestInjection(
             injector,
             request.getType(),
             request.getInstance(),
-            null,
+            /* binding= */ null,
             request.getSource(),
             injectionPoints,
             errors);
@@ -144,10 +145,34 @@ final class InjectionRequestProcessor extends AbstractProcessor {
           // Run injections if we're not in tool stage (ie, PRODUCTION or DEV),
           // or if we are in tool stage and the injection point is toolable.
           if (!isStageTool || memberInjector.getInjectionPoint().isToolable()) {
-            try {
-              memberInjector.inject(context, null);
-            } catch (InternalProvisionException e) {
-              errors.merge(e);
+            if (InternalFlags.getUseMethodHandlesOption()) {
+              try {
+                // In theory, constructing the handle to invoke it exactly once is expensive and
+                // wasteful, and it is true for
+                // directly injecting the member this is probably slower than the reflective
+                // SingleFieldInjector. However,
+                // by taking this path we::
+                // 1. Don't need to construct fastclasses for method injections
+                // (SingleMethodInjector).
+                // 2. construct fast classes for transitive injections (constructors/@Provides
+                // methods).
+                // 3. Can leverage or initialize caches for transitive InternalFactory.getHandle
+                // calls.
+                memberInjector
+                    .getInjectHandle(new LinkageContext())
+                    .invokeExact((Object) null, context);
+              } catch (InternalProvisionException e) {
+                errors.merge(e);
+              } catch (Throwable t) {
+                // This will propagate unexpected Errors.
+                throw InternalMethodHandles.sneakyThrow(t);
+              }
+            } else {
+              try {
+                memberInjector.inject(context, null);
+              } catch (InternalProvisionException e) {
+                errors.merge(e);
+              }
             }
           }
         }

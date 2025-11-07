@@ -25,6 +25,7 @@ import static com.google.inject.internal.SpiUtils.instance;
 import static com.google.inject.internal.SpiUtils.providerInstance;
 import static com.google.inject.name.Names.named;
 import static java.lang.annotation.RetentionPolicy.RUNTIME;
+import static org.junit.Assert.assertThrows;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
@@ -1245,7 +1246,6 @@ public class MapBinderTest extends TestCase {
     return result;
   }
 
-  @SuppressWarnings("unchecked")
   private <V> Set<V> setOf(V... elements) {
     return new HashSet<V>(Arrays.asList(elements));
   }
@@ -1461,7 +1461,6 @@ public class MapBinderTest extends TestCase {
     assertEquals("a", ((InstanceBinding) secondBinding).getInstance());
   }
 
-  @SuppressWarnings("rawtypes")
   public void testGetEntriesMissingProviderMapEntry() {
     List<com.google.inject.spi.Element> elements =
         Lists.newArrayList(Elements.getElements(new MapBinderWithTwoEntriesModule()));
@@ -1515,7 +1514,6 @@ public class MapBinderTest extends TestCase {
     return null;
   }
 
-  @SuppressWarnings("rawtypes")
   public void testGetEntriesMissingBindingForValue() {
     List<com.google.inject.spi.Element> elements =
         Lists.newArrayList(Elements.getElements(new MapBinderWithTwoEntriesModule()));
@@ -1626,6 +1624,48 @@ public class MapBinderTest extends TestCase {
       assertThat(e)
           .hasMessageThat()
           .contains("Map<Integer, ? extends String> was bound multiple times.");
+    }
+  }
+
+  public void testMapBinderConflicDoesntCauseErrorDuringLookupProcessor() {
+    Module module =
+        new AbstractModule() {
+          @Override
+          protected void configure() {
+            MapBinder<Integer, String> mapBinder =
+                MapBinder.newMapBinder(binder(), Integer.class, String.class);
+            mapBinder.addBinding(1).toInstance("1");
+            mapBinder.addBinding(1).toInstance("2"); // duplicate key
+            getProvider(new Key<Map<Integer, String>>() {});
+          }
+        };
+    CreationException e = assertThrows(CreationException.class, () -> Guice.createInjector(module));
+    assertThat(e).hasMessageThat().contains("Duplicate key \"1\" found in Map<Integer, String>.");
+  }
+
+  // Test a large map to ensure we don't create bad methodhandles that are too big or have too many
+  // parameters or are too recursive.
+
+  public void testLargeMapBinder() {
+    for (boolean permmitDuplicates : new boolean[] {true, false}) {
+      final int size = 100_000;
+      Module module =
+          new AbstractModule() {
+            @Override
+            protected void configure() {
+              MapBinder<Integer, String> mapBinder =
+                  MapBinder.newMapBinder(binder(), Integer.class, String.class);
+              if (permmitDuplicates) {
+                mapBinder = mapBinder.permitDuplicates();
+              }
+              for (int i = 0; i < size; i++) {
+                mapBinder.addBinding(i).toInstance(String.valueOf(i));
+              }
+            }
+          };
+      Injector injector = Guice.createInjector(module);
+      Map<Integer, String> map = injector.getInstance(new Key<Map<Integer, String>>() {});
+      assertThat(map).hasSize(size);
     }
   }
 

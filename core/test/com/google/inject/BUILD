@@ -2,6 +2,7 @@
 # Author: sameb@google.com (Sam Berlin)
 
 load("@rules_java//java:defs.bzl", "java_library")
+load("//:build_defs.bzl", "JAVAC_OPTS")
 load("//:test_defs.bzl", "guice_test_suites")
 
 package(
@@ -17,6 +18,11 @@ ADD_OPENS_SRCS = [
     "ImplicitBindingJdkPackagePrivateTest.java",
 ]
 
+TEST_JAVAC_OPTS = [
+    "-Xep:BetaApi:OFF",
+    "-Xdoclint:none",
+] + JAVAC_OPTS
+
 # Files that are shared by extensions also.
 # Typically this would go in a java/../testing package,
 # but we need to work with the open-source code structure,
@@ -24,7 +30,7 @@ ADD_OPENS_SRCS = [
 java_library(
     name = "testsupport",
     srcs = TEST_SUPPORT_SRCS,
-    javacopts = ["-Xep:BetaApi:OFF"],
+    javacopts = TEST_JAVAC_OPTS,
     visibility = [
         "//:src",
     ],
@@ -47,16 +53,18 @@ java_library(
             "AllTests.java",
         ],
     ),
-    javacopts = ["-Xep:BetaApi:OFF"],
+    javacopts = TEST_JAVAC_OPTS,
     deps = [
         ":testsupport",
         "//core/src/com/google/inject",
         "//third_party/java/aopalliance",
         "//third_party/java/asm",
+        "//third_party/java/error_prone:annotations",
         "//third_party/java/guava/base",
         "//third_party/java/guava/collect",
         "//third_party/java/guava/testing",
         "//third_party/java/guava/util/concurrent",
+        "//third_party/java/hamcrest",
         "//third_party/java/jakarta_inject",
         "//third_party/java/junit",
         "//third_party/java/truth",
@@ -66,7 +74,7 @@ java_library(
 java_library(
     name = "add_opens_tests",
     srcs = ADD_OPENS_SRCS,
-    javacopts = ["-Xep:BetaApi:OFF"],
+    javacopts = TEST_JAVAC_OPTS,
     deps = [
         "//core/src/com/google/inject",
         "//third_party/java/guava/base",
@@ -127,9 +135,10 @@ guice_test_suites(
 )
 
 [guice_test_suites(
-    name = "gen_tests_stack_trace_%s" % include_stack_trace_option,
+    name = "gen_tests_stack_trace_%s_use_method_handles_%s" % (include_stack_trace_option, use_method_handles_option),
     args = [
         "--guice_include_stack_traces=%s" % include_stack_trace_option,
+        "--guice_use_method_handles=%s" % use_method_handles_option,
     ],
     jvm_flags = [
         # those 2 options are required for some tests that checks stack traces
@@ -140,7 +149,7 @@ guice_test_suites(
         "small",
         "medium",
     ],
-    suffix = "_stack_trace_%s" % include_stack_trace_option,
+    suffix = "_stack_trace_%s_use_method_handles_%s" % (include_stack_trace_option, use_method_handles_option),
     deps = [
         ":add_opens_tests",
         ":tests",
@@ -148,12 +157,16 @@ guice_test_suites(
     ],
 ) for include_stack_trace_option in [
     "OFF",
+] for use_method_handles_option in [
+    "NO",
+    "YES",
 ]]
 
 [guice_test_suites(
-    name = "gen_tests_class_loading_%s" % custom_class_loading_option,
+    name = "gen_tests_class_loading_%s_method_handles_%s" % (custom_class_loading_option, use_method_handles_option),
     args = [
         "--guice_custom_class_loading=%s" % custom_class_loading_option,
+        "--guice_use_method_handles=%s" % use_method_handles_option,
     ],
     jvm_flags = [
         # those 2 options are required for some tests that checks stack traces
@@ -164,7 +177,7 @@ guice_test_suites(
         "small",
         "medium",
     ],
-    suffix = "_custom_class_loading_%s" % custom_class_loading_option,
+    suffix = "_custom_class_loading_%s_method_handles_%s" % (custom_class_loading_option, use_method_handles_option),
     deps = [
         ":add_opens_tests",
         ":tests",
@@ -174,4 +187,7 @@ guice_test_suites(
     "OFF",
     "ANONYMOUS",
     "CHILD",
+] for use_method_handles_option in [
+    "NO",
+    "YES",
 ]]

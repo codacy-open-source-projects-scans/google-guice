@@ -297,8 +297,8 @@ public abstract class Scoping {
     // ProviderToInternalFactoryAdapter here.  If you change the type make sure to update
     // SingletonScope as well.
     Provider<T> scoped =
-        scope.scope(key, new ProviderToInternalFactoryAdapter<T>(injector, creator));
-    return new InternalFactoryToProviderAdapter<T>(scoped, source);
+        scope.scope(key, ProviderToInternalFactoryAdapter.create(injector, creator));
+    return InternalFactoryToScopedProviderAdapter.create(scope, scoped, source);
   }
 
   /**

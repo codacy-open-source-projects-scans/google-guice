@@ -16,7 +16,6 @@
 
 package com.google.inject.internal;
 
-import com.google.inject.Binder;
 import com.google.inject.Binding;
 import com.google.inject.Key;
 import com.google.inject.Provider;
@@ -31,6 +30,7 @@ import com.google.inject.spi.ProviderBinding;
 import com.google.inject.spi.ProviderInstanceBinding;
 import com.google.inject.spi.ProviderKeyBinding;
 import com.google.inject.spi.UntargettedBinding;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -107,7 +107,7 @@ final class BindingProcessor extends AbstractBindingProcessor {
 
             @SuppressWarnings("unchecked") // safe because processor was constructed w/ it
             Binding<T> bindingT = (Binding<T>) binding;
-            Initializable<T> ref =
+            Optional<Initializable<T>> ref =
                 initializer.requestInjection(
                     injector,
                     /* type= */ null,
@@ -116,7 +116,10 @@ final class BindingProcessor extends AbstractBindingProcessor {
                     source,
                     injectionPoints,
                     errors);
-            ConstantFactory<? extends T> factory = new ConstantFactory<>(ref);
+            InternalFactory<? extends T> factory =
+                ref.isPresent()
+                    ? new InitializableFactory<>(ref.get())
+                    : ConstantFactory.create(instance, source);
             InternalFactory<? extends T> scopedFactory =
                 Scoping.scope(key, injector, factory, source, scoping);
             putBinding(
@@ -128,24 +131,37 @@ final class BindingProcessor extends AbstractBindingProcessor {
           @Override
           public Boolean visit(ProviderInstanceBinding<? extends T> binding) {
             prepareBinding();
-            jakarta.inject.Provider<? extends T> provider = binding.getUserSuppliedProvider();
+            @SuppressWarnings("unchecked") // always visited with Binding<T>
+            var provider = (jakarta.inject.Provider<T>) binding.getUserSuppliedProvider();
+            // This is how we support ProviderMethods and native multibinders. By detecting them
+            // here, we can leverage faster `InternalFactory` implementations.
             if (provider instanceof InternalProviderInstanceBindingImpl.Factory) {
-              @SuppressWarnings("unchecked")
               InternalProviderInstanceBindingImpl.Factory<T> asProviderMethod =
                   (InternalProviderInstanceBindingImpl.Factory<T>) provider;
-              return visitInternalProviderInstanceBindingFactory(asProviderMethod);
+              // Try to claim it exclusively, otherwise we will treat it as a normal provider
+              // instance binding.  This prevents undefined behavior where multiple injectors
+              // race to initialize the binding based on different settings.
+              if (asProviderMethod.bindToInjector(injector)) {
+                return visitInternalProviderInstanceBindingFactory(asProviderMethod);
+              }
             }
             Set<InjectionPoint> injectionPoints = binding.getInjectionPoints();
-            Initializable<? extends jakarta.inject.Provider<? extends T>> initializable =
-                initializer.<jakarta.inject.Provider<? extends T>>requestInjection(
+            Optional<Initializable<jakarta.inject.Provider<T>>> initializable =
+                initializer.requestInjection(
                     injector, /* type= */ null, provider, null, source, injectionPoints, errors);
-            // always visited with Binding<T>
-            @SuppressWarnings("unchecked")
+
+            @SuppressWarnings("unchecked") // always visited with Binding<T>
+            ProvisionListenerStackCallback<T> listener =
+                injector.provisionListenerStore.get((Binding<T>) binding);
+            int circularFactoryId = injector.circularFactoryIdFactory.next();
+            Class<? super T> rawType = key.getTypeLiteral().getRawType();
             InternalFactory<T> factory =
-                new InternalFactoryToInitializableAdapter<T>(
-                    initializable,
-                    source,
-                    injector.provisionListenerStore.get((ProviderInstanceBinding<T>) binding));
+                (initializable.isPresent()
+                    ? new InternalFactoryToInitializableAdapter<T>(
+                        rawType, initializable.get(), source, listener, circularFactoryId)
+                    : new ConstantProviderInternalFactory<T>(
+                        rawType, provider, source, listener, circularFactoryId));
+
             InternalFactory<? extends T> scopedFactory =
                 Scoping.scope(key, injector, factory, source, scoping);
             putBinding(
@@ -163,6 +179,7 @@ final class BindingProcessor extends AbstractBindingProcessor {
             @SuppressWarnings("unchecked")
             BoundProviderFactory<T> boundProviderFactory =
                 new BoundProviderFactory<T>(
+                    key.getTypeLiteral().getRawType(),
                     injector,
                     providerKey,
                     source,
@@ -260,14 +277,10 @@ final class BindingProcessor extends AbstractBindingProcessor {
   }
 
   private <T> void bindExposed(PrivateElements privateElements, Key<T> key) {
-    ExposedKeyFactory<T> exposedKeyFactory = new ExposedKeyFactory<>(key, privateElements);
+    Object source = privateElements.getExposedSource(key);
+    ExposedKeyFactory<T> exposedKeyFactory = new ExposedKeyFactory<>(key, source, privateElements);
     processedBindingData.addCreationListener(exposedKeyFactory);
     putBinding(
-        new ExposedBindingImpl<T>(
-            injector,
-            privateElements.getExposedSource(key),
-            key,
-            exposedKeyFactory,
-            privateElements));
+        new ExposedBindingImpl<T>(injector, source, key, exposedKeyFactory, privateElements));
   }
 }

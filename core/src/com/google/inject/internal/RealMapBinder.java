@@ -3,9 +3,11 @@ package com.google.inject.internal;
 import static com.google.inject.internal.Element.Type.MAPBINDER;
 import static com.google.inject.internal.Errors.checkConfiguration;
 import static com.google.inject.internal.Errors.checkNotNull;
+import static com.google.inject.internal.InternalMethodHandles.buildImmutableMapFactory;
 import static com.google.inject.internal.RealMultibinder.setOf;
 import static com.google.inject.util.Types.newParameterizedType;
 import static com.google.inject.util.Types.newParameterizedTypeWithOwner;
+import static java.lang.invoke.MethodType.methodType;
 
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
@@ -18,7 +20,9 @@ import com.google.common.collect.LinkedHashMultimap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Multimap;
+import com.google.common.collect.SetMultimap;
 import com.google.common.collect.Sets;
+import com.google.errorprone.annotations.Keep;
 import com.google.inject.Binder;
 import com.google.inject.Binding;
 import com.google.inject.Injector;
@@ -38,7 +42,10 @@ import com.google.inject.spi.ProviderInstanceBinding;
 import com.google.inject.spi.ProviderWithExtensionVisitor;
 import com.google.inject.util.Types;
 import java.lang.annotation.Annotation;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Type;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -234,7 +241,7 @@ public final class RealMapBinder<K, V> implements Module {
       Key<Map<K, V>> mapKey,
       RealMultibinder<Map.Entry<K, Provider<V>>> entrySetBinder) {
     RealMapBinder<K, V> mapBinder =
-        new RealMapBinder<K, V>(binder, keyType, valueType, mapKey, entrySetBinder);
+        new RealMapBinder<>(binder, keyType, valueType, mapKey, entrySetBinder);
     binder.install(mapBinder);
     return mapBinder;
   }
@@ -423,10 +430,9 @@ public final class RealMapBinder<K, V> implements Module {
       // We now build the Map<K, Set<Binding<V>>> from the entrySetBinder.
       // The entrySetBinder contains all of the ProviderMapEntrys, and once
       // we have those, it's easy to iterate through them to organize them by K.
-      Map<K, ImmutableSet.Builder<Binding<V>>> bindingMultimapMutable =
-          new LinkedHashMap<K, ImmutableSet.Builder<Binding<V>>>();
+      Map<K, ImmutableSet.Builder<Binding<V>>> bindingMultimapMutable = new LinkedHashMap<>();
       Map<K, Binding<V>> bindingMapMutable = new LinkedHashMap<>();
-      Multimap<K, Indexer.IndexedBinding> index = HashMultimap.create();
+      SetMultimap<K, Indexer.IndexedBinding> index = HashMultimap.create();
       Indexer indexer = new Indexer(injector);
       Multimap<K, Binding<V>> duplicates = null;
 
@@ -699,9 +705,8 @@ public final class RealMapBinder<K, V> implements Module {
 
   private static final class RealProviderMapProvider<K, V>
       extends RealMapBinderProviderWithDependencies<K, V, Map<K, Provider<V>>> {
-    private Map<K, Provider<V>> mapOfProviders;
-    private Set<Dependency<?>> dependencies = RealMapBinder.MODULE_DEPENDENCIES;
-    private boolean initialized;
+    private ImmutableMap<K, Provider<V>> mapOfProviders;
+    private ImmutableSet<Dependency<?>> dependencies = RealMapBinder.MODULE_DEPENDENCIES;
 
     private RealProviderMapProvider(BindingSelection<K, V> bindingSelection) {
       super(bindingSelection);
@@ -714,10 +719,6 @@ public final class RealMapBinder<K, V> implements Module {
 
     @Override
     protected void doInitialize(InjectorImpl injector, Errors errors) {
-      if (initialized) {
-        return;
-      }
-      initialized = true;
       ImmutableMap.Builder<K, Provider<V>> mapOfProvidersBuilder = ImmutableMap.builder();
       ImmutableSet.Builder<Dependency<?>> dependenciesBuilder = ImmutableSet.builder();
       for (Map.Entry<K, Binding<V>> entry : bindingSelection.getMapBindings().entrySet()) {
@@ -732,6 +733,17 @@ public final class RealMapBinder<K, V> implements Module {
     @Override
     protected Map<K, Provider<V>> doProvision(InternalContext context, Dependency<?> dependency) {
       return mapOfProviders;
+    }
+
+    @Override
+    protected Provider<Map<K, Provider<V>>> doMakeProvider(
+        InjectorImpl injector, Dependency<?> dependency) {
+      return InternalFactory.makeProviderFor(mapOfProviders, this);
+    }
+
+    @Override
+    protected MethodHandle doGetHandle(LinkageContext context) {
+      return InternalMethodHandles.constantFactoryGetHandle(mapOfProviders);
     }
   }
 
@@ -754,18 +766,12 @@ public final class RealMapBinder<K, V> implements Module {
 
     K[] keys;
 
-    private boolean initialized = false;
-
     ExtensionRealMapProvider(BindingSelection<K, V> bindingSelection) {
       super(bindingSelection);
     }
 
     @Override
     protected void doInitialize(InjectorImpl injector, Errors errors) throws ErrorsException {
-      if (initialized) {
-        return;
-      }
-      initialized = true;
       @SuppressWarnings("unchecked")
       K[] keysArray = (K[]) new Object[bindingSelection.getMapBindings().size()];
       keys = keysArray;
@@ -808,13 +814,46 @@ public final class RealMapBinder<K, V> implements Module {
         V value = injector.inject(context);
 
         if (value == null) {
-          throw createNullValueException(key, bindingSelection.getMapBindings().get(key));
+          throw createNullValueException(
+              key, bindingSelection.getMapBindings().get(key).getSource());
         }
 
         resultBuilder.put(key, value);
       }
 
       return resultBuilder.buildOrThrow();
+    }
+
+    @Override
+    protected MethodHandle doGetHandle(LinkageContext context) {
+      if (injectors == null) {
+        return InternalMethodHandles.constantFactoryGetHandle(ImmutableMap.of());
+      }
+      List<Map.Entry<K, MethodHandle>> entries = new ArrayList<>(injectors.length);
+      for (int i = 0; i < injectors.length; i++) {
+        var key = keys[i];
+        var valueHandle = injectors[i].getInjectHandle(context);
+
+        // Null check the value.
+        valueHandle =
+            MethodHandles.filterReturnValue(
+                valueHandle,
+                MethodHandles.insertArguments(
+                    MAYBE_THROW_NULL_VALUE_EXCEPTION_MH,
+                    1,
+                    key,
+                    bindingSelection.getMapBindings().get(key).getSource()));
+        entries.add(Map.entry(key, valueHandle));
+      }
+      return MethodHandles.dropArguments(buildImmutableMapFactory(entries), 1, Dependency.class);
+    }
+
+    @Override
+    protected Provider<Map<K, V>> doMakeProvider(InjectorImpl injector, Dependency<?> dependency) {
+      if (injectors == null) {
+        return InternalFactory.makeProviderFor(ImmutableMap.of(), this);
+      }
+      return InternalFactory.makeDefaultProvider(this, injector, dependency);
     }
 
     @Override
@@ -913,7 +952,6 @@ public final class RealMapBinder<K, V> implements Module {
 
           if (userSuppliedProvider instanceof ProviderMapEntry) {
             // Safe because of the instanceof check
-            @SuppressWarnings("unchecked")
             ProviderMapEntry<K, V> typedUserSuppliedProvider =
                 (ProviderMapEntry<K, V>) userSuppliedProvider;
             ProviderMapEntry<K, V> entry = typedUserSuppliedProvider;
@@ -1054,7 +1092,6 @@ public final class RealMapBinder<K, V> implements Module {
         extends RealMultimapBinderProviderWithDependencies<K, V, Map<K, Set<Provider<V>>>> {
       private Map<K, Set<Provider<V>>> multimapOfProviders;
       private Set<Dependency<?>> dependencies = RealMapBinder.MODULE_DEPENDENCIES;
-      private boolean initialized;
 
       private RealProviderMultimapProvider(Key<Map<K, V>> mapKey) {
         super(mapKey);
@@ -1067,10 +1104,6 @@ public final class RealMapBinder<K, V> implements Module {
 
       @Override
       protected void doInitialize(InjectorImpl injector, Errors errors) {
-        if (initialized) {
-          return;
-        }
-        initialized = true;
         ImmutableMap.Builder<K, Set<Provider<V>>> multimapOfProvidersBuilder =
             ImmutableMap.builder();
         ImmutableSet.Builder<Dependency<?>> dependenciesBuilder = ImmutableSet.builder();
@@ -1092,6 +1125,17 @@ public final class RealMapBinder<K, V> implements Module {
       protected Map<K, Set<Provider<V>>> doProvision(
           InternalContext context, Dependency<?> dependency) {
         return multimapOfProviders;
+      }
+
+      @Override
+      Provider<Map<K, Set<Provider<V>>>> doMakeProvider(
+          InjectorImpl injector, Dependency<?> dependency) {
+        return InternalFactory.makeProviderFor(multimapOfProviders, this);
+      }
+
+      @Override
+      protected MethodHandle doGetHandle(LinkageContext context) {
+        return InternalMethodHandles.constantFactoryGetHandle(multimapOfProviders);
       }
     }
 
@@ -1121,8 +1165,6 @@ public final class RealMapBinder<K, V> implements Module {
 
       private PerKeyData<K, V>[] perKeyDatas;
 
-      private boolean initialized = false;
-
       private RealMultimapProvider(Key<Map<K, V>> mapKey) {
         super(mapKey);
       }
@@ -1134,11 +1176,6 @@ public final class RealMapBinder<K, V> implements Module {
 
       @Override
       protected void doInitialize(InjectorImpl injector, Errors errors) throws ErrorsException {
-        if (initialized) {
-          return;
-        }
-        initialized = true;
-
         @SuppressWarnings({"unchecked", "rawtypes"})
         PerKeyData<K, V>[] typedPerKeyData =
             new PerKeyData[bindingSelection.getMapBindings().size()];
@@ -1179,7 +1216,8 @@ public final class RealMapBinder<K, V> implements Module {
       @Override
       protected Map<K, Set<V>> doProvision(InternalContext context, Dependency<?> dependency)
           throws InternalProvisionException {
-        ImmutableMap.Builder<K, Set<V>> resultBuilder = ImmutableMap.builder();
+        ImmutableMap.Builder<K, Set<V>> resultBuilder =
+            ImmutableMap.builderWithExpectedSize(perKeyDatas.length);
 
         for (PerKeyData<K, V> perKeyData : perKeyDatas) {
           ImmutableSet.Builder<V> bindingsBuilder = ImmutableSet.builder();
@@ -1189,7 +1227,7 @@ public final class RealMapBinder<K, V> implements Module {
             V value = injector.inject(context);
 
             if (value == null) {
-              throw createNullValueException(perKeyData.key, perKeyData.bindings[i]);
+              throw createNullValueException(perKeyData.key, perKeyData.bindings[i].getSource());
             }
 
             bindingsBuilder.add(value);
@@ -1199,6 +1237,46 @@ public final class RealMapBinder<K, V> implements Module {
         }
 
         return resultBuilder.buildOrThrow();
+      }
+
+      @Override
+      Provider<Map<K, Set<V>>> doMakeProvider(InjectorImpl injector, Dependency<?> dependency) {
+        if (perKeyDatas.length == 0) {
+          return InternalFactory.makeProviderFor(ImmutableMap.of(), this);
+        }
+        return InternalFactory.makeDefaultProvider(this, injector, dependency);
+      }
+
+      @Override
+      protected MethodHandle doGetHandle(LinkageContext context) {
+        if (perKeyDatas.length == 0) {
+          return InternalMethodHandles.constantFactoryGetHandle(ImmutableMap.of());
+        }
+        List<Map.Entry<K, MethodHandle>> entries = new ArrayList<>(perKeyDatas.length);
+        for (PerKeyData<K, V> perKeyData : perKeyDatas) {
+          // Accumulate the elements for each key.
+          List<MethodHandle> elementHandles = new ArrayList<>(perKeyData.injectors.length);
+          for (int j = 0; j < perKeyData.injectors.length; j++) {
+            SingleParameterInjector<V> injector = perKeyData.injectors[j];
+            MethodHandle elementHandle = injector.getInjectHandle(context);
+            // Null check each element.
+            elementHandle =
+                MethodHandles.filterReturnValue(
+                    elementHandle,
+                    MethodHandles.insertArguments(
+                        MAYBE_THROW_NULL_VALUE_EXCEPTION_MH,
+                        1,
+                        perKeyData.key,
+                        perKeyData.bindings[j].getSource()));
+            elementHandles.add(elementHandle);
+          }
+          // Construct the set of the values and add it to the map.
+          entries.add(
+              Maps.immutableEntry(
+                  perKeyData.key, InternalMethodHandles.buildImmutableSetFactory(elementHandles)));
+        }
+
+        return MethodHandles.dropArguments(buildImmutableMapFactory(entries), 1, Dependency.class);
       }
     }
   }
@@ -1235,6 +1313,11 @@ public final class RealMapBinder<K, V> implements Module {
       return entry;
     }
 
+    @Override
+    protected MethodHandle doGetHandle(LinkageContext context) {
+      return InternalMethodHandles.constantFactoryGetHandle(entry);
+    }
+
     K getKey() {
       return key;
     }
@@ -1267,6 +1350,7 @@ public final class RealMapBinder<K, V> implements Module {
   private abstract static class RealMapBinderProviderWithDependencies<K, V, P>
       extends InternalProviderInstanceBindingImpl.Factory<P> {
     final BindingSelection<K, V> bindingSelection;
+    private boolean initialized = false;
 
     private RealMapBinderProviderWithDependencies(BindingSelection<K, V> bindingSelection) {
       // While MapBinders only depend on bindings created in modules so we could theoretically
@@ -1281,9 +1365,22 @@ public final class RealMapBinder<K, V> implements Module {
 
     @Override
     final void initialize(InjectorImpl injector, Errors errors) throws ErrorsException {
-      if (bindingSelection.tryInitialize(injector, errors)) {
-        doInitialize(injector, errors);
+      if (!initialized) {
+        if (bindingSelection.tryInitialize(injector, errors)) {
+          doInitialize(injector, errors);
+          initialized = true; // only set this if we actually initialized.
+        }
       }
+    }
+
+    @Override
+    public final Provider<P> makeProvider(InjectorImpl injector, Dependency<?> dependency) {
+      // The !initialized case typically means that an error was encountered during initialization
+      // so use a trivial implementation
+      if (initialized) {
+        return doMakeProvider(injector, dependency);
+      }
+      return super.makeProvider(injector, dependency);
     }
 
     /**
@@ -1292,6 +1389,8 @@ public final class RealMapBinder<K, V> implements Module {
      */
     protected abstract void doInitialize(InjectorImpl injector, Errors errors)
         throws ErrorsException;
+
+    protected abstract Provider<P> doMakeProvider(InjectorImpl injector, Dependency<?> dependency);
 
     @Override
     public boolean equals(Object obj) {
@@ -1319,6 +1418,7 @@ public final class RealMapBinder<K, V> implements Module {
       extends InternalProviderInstanceBindingImpl.Factory<P> {
     final Key<Map<K, V>> mapKey;
     BindingSelection<K, V> bindingSelection;
+    private boolean initialized = false;
 
     private RealMultimapBinderProviderWithDependencies(Key<Map<K, V>> mapKey) {
       // While MapBinders only depend on bindings created in modules so we could theoretically
@@ -1338,6 +1438,9 @@ public final class RealMapBinder<K, V> implements Module {
      */
     @Override
     final void initialize(InjectorImpl injector, Errors errors) throws ErrorsException {
+      if (initialized) {
+        return;
+      }
       Binding<Map<K, V>> mapBinding = injector.getExistingBinding(mapKey);
       ProviderInstanceBinding<Map<K, V>> providerInstanceBinding =
           (ProviderInstanceBinding<Map<K, V>>) mapBinding;
@@ -1349,8 +1452,19 @@ public final class RealMapBinder<K, V> implements Module {
 
       if (bindingSelection.tryInitialize(injector, errors)) {
         doInitialize(injector, errors);
+        initialized = true; // only set this if we actually initialized.
       }
     }
+
+    @Override
+    public final Provider<P> makeProvider(InjectorImpl injector, Dependency<?> dependency) {
+      if (initialized) {
+        return doMakeProvider(injector, dependency);
+      }
+      return super.makeProvider(injector, dependency);
+    }
+
+    abstract Provider<P> doMakeProvider(InjectorImpl injector, Dependency<?> dependency);
 
     /**
      * Initialize the factory. BindingSelection is guaranteed to be initialized at this point and
@@ -1371,12 +1485,26 @@ public final class RealMapBinder<K, V> implements Module {
     }
   }
 
-  private static <K, V> InternalProvisionException createNullValueException(
-      K key, Binding<V> binding) {
+  private static final MethodHandle MAYBE_THROW_NULL_VALUE_EXCEPTION_MH =
+      InternalMethodHandles.findStaticOrDie(
+          RealMapBinder.class,
+          "maybeThrowNullValueException",
+          methodType(Object.class, Object.class, Object.class, Object.class));
+
+  @Keep
+  static Object maybeThrowNullValueException(Object value, Object key, Object source)
+      throws InternalProvisionException {
+    if (value == null) {
+      throw createNullValueException(key, source);
+    }
+    return value;
+  }
+
+  private static <K> InternalProvisionException createNullValueException(K key, Object source) {
     return InternalProvisionException.create(
         ErrorId.NULL_VALUE_IN_MAP,
         "Map injection failed due to null value for key \"%s\", bound at: %s",
         key,
-        binding.getSource());
+        source);
   }
 }

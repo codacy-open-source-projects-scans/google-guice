@@ -223,8 +223,8 @@ public class BinderTest extends TestCase {
     } catch (CreationException expected) {
       assertContains(
           expected.getMessage(),
-          "1) Binding to null instances is not allowed. Use toProvider(Providers.of(null))",
-          "2) Binding to null instances is not allowed. Use toProvider(Providers.of(null))");
+          "1) Binding to null instances is not allowed. Use toProvider(() -> null)",
+          "2) Binding to null instances is not allowed. Use toProvider(() -> null)");
     }
   }
 
@@ -404,7 +404,6 @@ public class BinderTest extends TestCase {
           });
       fail();
     } catch (CreationException expected) {
-      expected.printStackTrace();
       assertContains(
           expected.getMessage(),
           "BinderTest$HasImplementedBy1 was bound multiple times.",
